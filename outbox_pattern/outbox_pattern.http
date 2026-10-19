@@ -1,0 +1,69 @@
+@outbox_pattern_HostAddress = http://localhost:5100
+
+GET {{outbox_pattern_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
+
+# =====================================================================
+#  OUTBOX PATTERN DEMO  (xem docs/OUTBOX_PATTERN.md)
+#  Các endpoint /demo chỉ hoạt động khi ASPNETCORE_ENVIRONMENT=Development.
+# =====================================================================
+
+### 0) Xem toàn bộ trạng thái: broker, outbox, inbox, tồn kho
+GET {{outbox_pattern_HostAddress}}/demo/state
+
+### 1) KỊCH BẢN CƠ BẢN: tạo order.
+#    Order + OutboxMessage được ghi trong CÙNG một transaction. Chừng 1 giây sau relay publish,
+#    consumer trừ kho. Gọi lại (0) để thấy outbox.processed và tồn kho thay đổi.
+POST {{outbox_pattern_HostAddress}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-001", "quantity": 2, "customerEmail": "a@example.com" }
+
+### 2) KỊCH BẢN BROKER SẬP: tắt broker, tạo order, quan sát, rồi bật lại.
+#    Order vẫn tạo thành công (201). Outbox.pending tăng, attempts tăng dần theo backoff, tồn kho CHƯA đổi.
+#    Bật broker lại -> relay tự gửi bù -> tồn kho được trừ. Không mất event nào.
+PUT {{outbox_pattern_HostAddress}}/demo/broker/down
+
+###
+POST {{outbox_pattern_HostAddress}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-002", "quantity": 5, "customerEmail": "b@example.com" }
+
+###
+GET {{outbox_pattern_HostAddress}}/demo/state
+
+###
+PUT {{outbox_pattern_HostAddress}}/demo/broker/up
+
+### 3) KỊCH BẢN BẢN TRÙNG (at-least-once): broker nhận message nhưng làm mất ack.
+#    Relay tưởng thất bại nên gửi lại -> consumer nhận cùng một message nhiều lần.
+#    Xem log: "Duplicate message ... skipped". Tồn kho vẫn chỉ bị trừ ĐÚNG MỘT lần nhờ inbox.
+PUT {{outbox_pattern_HostAddress}}/demo/broker/loseack
+
+###
+POST {{outbox_pattern_HostAddress}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-003", "quantity": 7, "customerEmail": "c@example.com" }
+
+###
+PUT {{outbox_pattern_HostAddress}}/demo/broker/up
+
+### 4) ĐỐI CHỨNG: dual write "ngây thơ" (ANTI-PATTERN). Tắt broker rồi gọi endpoint này.
+#    Kết quả: 500, nhưng order VẪN nằm trong database và event mất vĩnh viễn (outbox không có dòng nào,
+#    tồn kho không bao giờ được trừ dù bật lại broker). So với kịch bản 2.
+PUT {{outbox_pattern_HostAddress}}/demo/broker/down
+
+###
+POST {{outbox_pattern_HostAddress}}/demo/orders-naive
+Content-Type: application/json
+
+{ "sku": "SKU-001", "quantity": 10, "customerEmail": "naive@example.com" }
+
+###
+PUT {{outbox_pattern_HostAddress}}/demo/broker/up
+
+###

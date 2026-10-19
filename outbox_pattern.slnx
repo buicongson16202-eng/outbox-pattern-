@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="outbox_pattern/outbox_pattern.csproj" />
+  <Project Path="outbox_pattern.Tests/outbox_pattern.Tests.csproj" />
+</Solution>
