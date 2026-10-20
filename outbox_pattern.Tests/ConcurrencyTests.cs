@@ -227,8 +227,8 @@ public class ConcurrencyTests(LocalDbFixture db) : DbTestBase(db)
 
     /// <summary>
     /// Publisher của một relay: ghi lại relay nào đã publish message nào. Lần publish ĐẦU TIÊN của mỗi relay bị giữ lại một lúc
-    /// (relay vẫn đang mở transaction và giữ khoá các dòng nó đã claim) để các relay còn lại — quét mỗi 50 ms — chắc chắn chạy
-    /// truy vấn claim của chúng ĐÚNG LÚC dòng đó đang bị khoá; đó là khoảnh khắc sinh ra bản trùng nếu thiếu UPDLOCK/READPAST.
+    /// (relay đã claim lô nhưng chưa publish xong) để các relay còn lại — quét mỗi 50 ms — chắc chắn chạy truy vấn claim của chúng
+    /// ĐÚNG LÚC các dòng đó đang được lease; đó là khoảnh khắc sinh ra bản trùng nếu việc claim không nguyên tử.
     /// Các lần publish sau nghỉ một chút để các lô trải dài hơn.
     /// </summary>
     private sealed class ContendedPublisher(int relayIndex, ConcurrentDictionary<Guid, ConcurrentBag<int>> publishes)

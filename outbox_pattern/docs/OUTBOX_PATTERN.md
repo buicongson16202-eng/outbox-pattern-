@@ -206,31 +206,39 @@ await db.SaveChangesAsync(cancellationToken);   // một transaction duy nhất
 
 Controller **không bao giờ gọi broker**. Request trả về ngay sau khi commit nên không phụ thuộc độ trễ hay sự cố của broker (**đã kiểm chứng:** broker sập mà `POST /orders` vẫn 201).
 
-### 4.2 Bước 2 — Relay: claim, publish, đánh dấu
+### 4.2 Bước 2 — Relay: claim bằng lease, publish, đánh dấu
 
-[OutboxProcessor.cs](../Messaging/OutboxProcessor.cs) chạy như `BackgroundService`, mỗi nhịp (mặc định 1 giây) làm:
+[OutboxProcessor.cs](../Messaging/OutboxProcessor.cs) chạy như `BackgroundService`, mỗi nhịp (mặc định 1 giây) làm các việc dưới đây. **Không có transaction nào kéo dài**: mỗi câu lệnh là một thao tác ngắn, tự commit, và lúc gọi broker thì relay không giữ khoá nào của DB.
 
 ```
-BEGIN TRANSACTION
-  1. CLAIM  : SELECT TOP (20) ... FROM OutboxMessages WITH (UPDLOCK, READPAST, ROWLOCK)
-              WHERE ProcessedOnUtc IS NULL AND NextAttemptOnUtc <= now
-              ORDER BY NextAttemptOnUtc, OccurredOnUtc
-  2. PUBLISH: với từng message → broker.PublishAsync (có timeout, chờ ack)
-  3. MARK   : thành công → ProcessedOnUtc = now
-              thất bại   → Attempts++, LastError, NextAttemptOnUtc = now + backoff, rồi DỪNG lô
-COMMIT
+② CLAIM  (giữ chỗ bằng lease; đọc không khoá, rồi mỗi dòng 1 câu UPDATE nguyên tử, chỉ giữ khoá dòng vài ms)
+     SELECT TOP (20) ... WHERE ProcessedOnUtc IS NULL AND NextAttemptOnUtc <= now
+                         ORDER BY NextAttemptOnUtc, OccurredOnUtc
+     với từng dòng đọc được:
+       UPDATE OutboxMessages SET NextAttemptOnUtc = now + ClaimLease
+        WHERE Id = @id AND ProcessedOnUtc IS NULL AND NextAttemptOnUtc = @giá_trị_vừa_đọc
+       → ảnh hưởng 1 dòng : relay này THẮNG, sở hữu lease của dòng đó
+       → ảnh hưởng 0 dòng : relay khác đã giành trước, bỏ qua dòng này
+③ PUBLISH  với từng dòng đã claim → broker.PublishAsync (NGOÀI mọi transaction, có PublishTimeout, chờ ④ ack)
+⑤ MARK     thành công → UPDATE SET ProcessedOnUtc = now, LastError = NULL
+           thất bại   → UPDATE SET Attempts = Attempts + 1, LastError, NextAttemptOnUtc = now + backoff, rồi DỪNG lô
+           phần lô chưa xử lý → UPDATE trả NextAttemptOnUtc về giá trị ban đầu (nhả lease sớm)
 ```
+
+Toàn bộ viết bằng EF Core (`ToListAsync` + `ExecuteUpdateAsync`), không còn SQL thô và không phụ thuộc hint riêng của SQL Server.
 
 Các quyết định thiết kế đáng chú ý:
 
-- **Khoá hàng khi claim.** `UPDLOCK` giữ các dòng cho riêng relay này đến khi commit; `READPAST` khiến relay khác **bỏ qua** dòng đang bị khoá thay vì chờ; `ROWLOCK` tránh leo thang khoá cả bảng. Đây là cách các instance chia việc mà không cần điều phối. Tương đương PostgreSQL/MySQL 8/Oracle: `FOR UPDATE SKIP LOCKED`.
-- **Chỉ đánh dấu "đã gửi" SAU khi broker xác nhận.** Đánh dấu trước thì thành at-most-once và mất event khi crash.
-- **Process chết giữa chừng thì sao?** Transaction chưa commit nên SQL Server tự rollback khi connection đứt, các dòng quay lại "chưa xử lý" và instance khác nhặt lên. Hệ quả: message có thể bị gửi lại → at-least-once (xem mục 5).
-- **Timeout cho mỗi lần publish** (`PublishTimeout`). Relay đang giữ transaction + row-lock; một lời gọi broker treo vô hạn sẽ giữ lock vô hạn.
-- **Dừng lô ngay khi có lỗi.** Lỗi publish thường nghĩa là broker đang gặp sự cố. Dừng sớm để không giữ lock lâu và không "đốt" số lần thử của các message phía sau.
+- **Lease thay cho khoá giữ trong transaction.** Claim thực chất là "đẩy `NextAttemptOnUtc` ra xa" để các relay khác (vốn chỉ lấy dòng có `NextAttemptOnUtc <= now`) không thấy dòng đó nữa. Câu `UPDATE` có điều kiện `NextAttemptOnUtc = @giá_trị_đã_đọc` đóng vai trò compare-and-swap: hai relay cùng đọc một dòng thì DB chỉ cho **một** bên cập nhật thành công. Không cần leader election hay bảng điều phối.
+- **Không giữ khoá lúc gọi broker.** Broker chậm hoặc treo chỉ làm relay đó chậm, không kéo theo lock-wait, connection bị giữ hay deadlock trong DB nghiệp vụ.
+- **Chỉ đánh dấu "đã gửi" SAU khi broker xác nhận (④).** Đánh dấu trước thì thành at-most-once và mất event khi crash.
+- **Relay chết giữa chừng thì sao?** Không có transaction để rollback, nhưng lease có hạn (`ClaimLease`, mặc định 60 giây): hết hạn thì `NextAttemptOnUtc <= now` lại đúng và relay khác nhặt lên. Hệ quả: message có thể bị gửi lại → at-least-once (xem mục 5). Đổi lại, thời gian tiếp quản là tối đa `ClaimLease` chứ không tức thì như khi DB tự nhả khoá lúc connection đứt.
+- **Relay chỉ chậm (không chết) vẫn có thể gây bản trùng:** nếu một lô xử lý lâu hơn `ClaimLease`, lease hết hạn và relay khác publish lại cùng message. Vô hại về tính đúng đắn nhờ inbox, chỉ tốn công. Đặt `ClaimLease` lớn hơn thời gian xử lý một lô.
+- **Timeout cho mỗi lần publish** (`PublishTimeout`). Broker treo vô hạn thì relay đứng và lease của cả lô cạn dần.
+- **Dừng lô ngay khi có lỗi.** Lỗi publish thường nghĩa là broker đang gặp sự cố. Dừng sớm để không "đốt" số lần thử của các message phía sau; những dòng đã claim mà chưa publish được trả lease ngay để relay khác nhặt.
 - **Backoff theo từng dòng** (2s, 4s, 8s… tối đa `MaxBackoff`). Một message "độc" luôn lỗi bị đẩy lùi nên **không chặn** các message khác.
 - **Không bao giờ tự bỏ cuộc.** Relay thử lại vô hạn thay vì chuyển sang dead-letter sau N lần, vì broker sập 1 giờ không được phép làm mất event. Thay vào đó `Attempts`/`LastError` và `oldestPendingAgeSeconds` (trong `GET /demo/state`) là tín hiệu để cảnh báo. Xem mục 12 về poison message.
-- **Tắt ứng dụng êm.** Khi nhận tín hiệu dừng, relay không đụng tới phần còn lại của lô và commit những message *đã* gửi (bằng `CancellationToken.None`) để giảm số bản trùng khi khởi động lại.
+- **Tắt ứng dụng êm.** Khi nhận tín hiệu dừng, relay không đụng tới phần còn lại của lô, ghi kết quả của các message *đã* gửi (bằng `CancellationToken.None`) và trả lease phần còn lại để giảm số bản trùng khi khởi động lại.
 - **Relay không deserialize payload**, chỉ chuyển nguyên văn: không bị vỡ khi schema event đổi.
 
 ### 4.3 Bước 3 — Consumer + Inbox
@@ -252,33 +260,120 @@ Lỗi nghiệp vụ (hết hàng, SKU lạ) **không** phải lỗi kỹ thuật
 
 [MessageCleanupService.cs](../Messaging/MessageCleanupService.cs) xoá theo lô 1000 dòng: outbox đã xử lý quá `OutboxRetention` (mặc định 7 ngày), inbox quá `InboxRetention` (mặc định 14 ngày). Lưu ý **inbox phải được giữ lâu hơn khoảng thời gian dài nhất mà một message còn có thể bị giao lại** (broker sập + backoff + redelivery); xoá sớm hơn thì bản trùng đến muộn bị xử lý như message mới.
 
-### 4.5 Toàn cảnh một request và các "điểm chết"
+### 4.5 Toàn cảnh luồng: các bước, hai loại ack, và lỗi ở từng bước
+
+#### 4.5.1 Luồng thành công
+
+Điều cần nhớ trước: **producer không bao giờ gọi relay.** Chỗ bàn giao giữa hai bên chính là bảng `OutboxMessages` trong DB; relay tự quét (polling) rồi thấy dòng mới. Vì vậy không có bước "producer → relay" nào có thể lỗi theo kiểu mạng; chỉ có "ghi DB" (①) và "relay đọc DB" (②).
 
 ```
-Client      Orders API            DB                    Relay            Broker        Consumer
-  │ POST       │                   │                      │                │              │
-  │───────────►│ BEGIN             │                      │                │              │
-  │            │ INSERT Orders     │                      │                │              │
-  │            │ INSERT Outbox     │                      │                │              │
-  │            │ COMMIT ──────────►│ (đã bền vững) ①      │                │              │
-  │◄───────────│ 201 ②             │                      │                │              │
-  │            │                   │◄─ BEGIN, SELECT ...  │                │              │
-  │            │                   │   UPDLOCK,READPAST ──│                │              │
-  │            │                   │                      │── publish ────►│              │
-  │            │                   │                      │◄── ack ③ ──────│── deliver ──►│ BEGIN
-  │            │                   │◄─ UPDATE processed ──│                │              │ INSERT inbox ⑤
-  │            │                   │◄─ COMMIT ④           │                │              │ UPDATE stock
-  │            │                   │                      │                │              │ COMMIT
+Client    Orders API        DB (Orders + Outbox)        Relay             Broker            Consumer (+ DB Inventory)
+  │ POST      │                     │                     │                  │                      │
+  │──────────►│ ① BEGIN             │                     │                  │                      │
+  │           │ INSERT Orders       │                     │                  │                      │
+  │           │ INSERT Outbox       │                     │                  │                      │
+  │           │ COMMIT ────────────►│ (đã bền vững)       │                  │                      │
+  │◄──────────│ 201                 │                     │                  │                      │
+  │                                 │                     │                  │                      │
+  │            ........ không ai gọi relay; đến nhịp quét kế tiếp (≤ 1 giây) ........              │
+  │                                 │◄─ ② SELECT pending ─│                  │                      │
+  │                                 │◄─ ② UPDATE lease ───│  (claim, CAS)    │                      │
+  │                                 │                     │── ③ publish ───►│                      │
+  │                                 │                     │                  │ lưu message          │
+  │                                 │                     │◄─ ④ ACK(confirm)─│                      │
+  │                                 │◄─ ⑤ ProcessedOnUtc ─│                  │── ⑥ deliver ────────►│ ⑦ BEGIN
+  │                                 │   = now             │                  │                      │ INSERT inbox (PK)
+  │                                 │                     │                  │                      │ UPDATE stock
+  │                                 │                     │                  │                      │ COMMIT
+  │                                 │                     │                  │◄─ ⑧ ACK (consumer) ──│
 ```
 
-| Chết/lỗi tại | Điều gì xảy ra | Hồi phục |
+Ý nghĩa từng bước:
+
+| Bước | Ai → ai | Việc gì | Bằng chứng "đã xong" |
+|---|---|---|---|
+| ① | Producer → DB | Một transaction: `INSERT Orders` + `INSERT OutboxMessages` | `COMMIT` thành công |
+| ② | Relay → DB | Đọc dòng pending, giành lease bằng `UPDATE` có điều kiện | 1 dòng bị ảnh hưởng |
+| ③ | Relay → Broker | `PublishAsync` kèm `MessageId` cố định | (chờ ④) |
+| ④ | **Broker → Relay** | **Ack của publisher**: "tôi đã nhận và lưu message của bạn" (publisher confirm) | `PublishAsync` trả về không lỗi |
+| ⑤ | Relay → DB | `UPDATE ProcessedOnUtc = now` | 1 dòng bị ảnh hưởng |
+| ⑥ | Broker → Consumer | Giao message | — |
+| ⑦ | Consumer → DB Inventory | Một transaction: `INSERT InboxMessages` + `UPDATE StockItems` | `COMMIT` thành công |
+| ⑧ | **Consumer → Broker** | **Ack của consumer**: "tôi đã xử lý xong, có thể xoá khỏi hàng đợi" | broker nhận ack |
+
+#### 4.5.2 Ai là bên gửi ack đầu tiên? Có HAI loại ack khác nhau
+
+Đây là chỗ dễ nhầm nhất: **ack ④ và ack ⑧ là hai thứ khác nhau, không nối tiếp nhau.**
+
+| | ④ Ack của **broker → relay** | ⑧ Ack của **consumer → broker** |
 |---|---|---|
-| Trước COMMIT ① | Không có order, không có outbox. Nhất quán | Client nhận lỗi/timeout và gọi lại |
-| Sau COMMIT ①, trước khi client nhận 201 ② | Order + outbox đều có, nhưng client không biết | Event vẫn sẽ được gửi. Nhưng nếu client gọi lại sẽ tạo order thứ hai — **outbox không giải quyết idempotency của request đầu vào**, cần idempotency key ở API |
-| Broker sập | Relay không publish được, ghi `Attempts`/`NextAttemptOnUtc` | Tự gửi bù khi broker hồi phục (đã kiểm chứng) |
-| Ack bị mất ③ | Broker đã nhận nhưng relay tưởng lỗi, sẽ gửi lại | Consumer nhận bản trùng → inbox ⑤ chặn (đã kiểm chứng) |
-| Relay chết sau publish, trước COMMIT ④ | Transaction rollback, dòng outbox vẫn "chưa xử lý" | Instance khác publish lại → bản trùng → inbox chặn (đã kiểm chứng bằng `kill -9`) |
-| Consumer chết giữa transaction | Rollback cả inbox lẫn stock | Broker giao lại message chưa được ack |
+| Nghĩa | "Broker đã nhận và lưu bền vững message" | "Consumer đã xử lý xong message" |
+| Ai gửi cho ai | Broker gửi cho relay | Consumer gửi cho broker |
+| Khi nào | Ngay khi broker lưu xong, **không chờ consumer** | Sau khi transaction của consumer đã commit |
+| Tác dụng | Relay được phép ghi `ProcessedOnUtc` (⑤) | Broker được phép xoá message, ngừng giao lại |
+| Mất thì sao | Relay gửi lại → bản trùng | Broker giao lại → bản trùng |
+| Trong code | `OutboxProcessor` chờ `publisher.PublishAsync(...)` trả về | `InventoryConsumer` (broker thật: ack sau khi `CommitAsync`) |
+
+Vậy trả lời trực tiếp: **ack đầu tiên là ④ (broker → relay)**, và nó đến *độc lập* với việc consumer đã nhận hay chưa. Trong sơ đồ, ④ và ⑥ cùng xuất phát từ lúc broker đã lưu message nên **thứ tự giữa chúng không được bảo đảm**: consumer có thể xử lý xong (⑦, ⑧) trước khi relay kịp ghi ⑤. Điều này an toàn vì mỗi bên chỉ dựa vào trạng thái bền vững của chính nó.
+
+Hệ quả thiết kế: **`ProcessedOnUtc` chỉ có nghĩa "broker đã nhận"**, không có nghĩa "consumer đã xử lý". Outbox chỉ chịu trách nhiệm đưa được message tới broker; việc consumer xử lý đúng một lần là của inbox.
+
+> Với `InMemoryBroker` của demo: ack ④ chính là việc `PublishAsync` trả về (ngay sau khi message được đưa vào hàng đợi). Broker giả lập không theo dõi ack ⑧ nên khi consumer lỗi thì `InventoryConsumer` tự `RequeueAsync` để mô phỏng việc broker thật giao lại message chưa được ack.
+
+#### 4.5.3 Trạng thái của một dòng outbox
+
+```
+ ① INSERT (cùng transaction với nghiệp vụ)
+        │
+        ▼
+ ┌──────────────┐  ② giành lease   ┌──────────────┐  ④ có ACK, ⑤ ghi   ┌───────────────┐
+ │   PENDING    │─────────────────►│    LEASED    │───────────────────►│   PROCESSED   │──► Cleanup xoá sau 7 ngày
+ │ ProcessedOn  │                  │ NextAttempt  │                    │ ProcessedOn   │
+ │   = NULL     │                  │ = now+lease  │                    │   = thời điểm │
+ └──────────────┘                  └──────┬───────┘                    └───────────────┘
+        ▲                                 │
+        │  • ③ lỗi/timeout: Attempts++, NextAttempt = now + backoff
+        │  • lease hết hạn (relay chết/quá chậm, hoặc ⑤ không ghi được)
+        │  • tắt êm / dừng lô: nhả lease sớm
+        └─────────────────────────────────┘
+```
+
+Quy tắc duy nhất làm nên độ tin cậy: **dòng chỉ rời `PENDING` vĩnh viễn khi có ack ④ rồi ghi ⑤ thành công.** Mọi trường hợp "không chắc" đều quay về `PENDING`, tức là **gửi lại** chứ không bao giờ bỏ rơi.
+
+#### 4.5.4 Lỗi ở từng bước thì sao?
+
+Với mỗi bước, hãy tự hỏi ba câu: **(a)** hiệu ứng của bước đó đã xảy ra chưa? **(b)** bên thực hiện có *biết* kết quả không? **(c)** trạng thái bền vững còn lại trong DB/broker là gì? Phần lớn rắc rối đến từ trường hợp "đã xảy ra nhưng bên gửi không biết" (mất ack, timeout), vì khi đó cách an toàn duy nhất là gửi lại.
+
+```
+①  ──✗──► rollback, không còn dấu vết ──────────────────────────► KẾT THÚC (nhất quán, client thử lại)
+①  ──✓──► ②  ──✗──► dòng vẫn PENDING (hoặc lease sắp hết hạn) ──► nhịp sau thử lại            (chỉ TRỄ)
+          ②  ──✓──► ③  ──✗(biết chắc lỗi)──► Attempts++, backoff ► thử lại                      (chỉ TRỄ)
+                    ③  ──✗(timeout/mất ack, broker CÓ THỂ đã nhận)► coi như lỗi, gửi lại         (có thể TRÙNG)
+                    ③  ──✓──► ④ ──► ⑤ ──✗──► dòng quay về PENDING, gửi lại                      (TRÙNG)
+                                    ⑤ ──✓──► relay xong
+                              ⑥ ──✗──► message nằm lại ở broker, giao khi consumer về           (chỉ TRỄ)
+                              ⑦ ──✗──► rollback inbox + stock, không ack, broker giao lại       (chỉ TRỄ)
+                              ⑦ ──✓──► ⑧ ──✗──► broker giao lại, inbox chặn bản trùng           (TRÙNG, bị chặn)
+```
+
+| Bước lỗi | Điều gì đã xảy ra / bên nào biết | Trạng thái còn lại | Hồi phục | Hậu quả |
+|---|---|---|---|---|
+| **① trước COMMIT** (validation, deadlock, đứt kết nối, process chết) | Chưa có gì được ghi. Client nhận lỗi hoặc timeout | Không có order, không có outbox | Client gọi lại | Nhất quán. Không có event ma |
+| **① sau COMMIT**, chết trước khi trả 201 | Order + outbox đã commit, client **không biết** | Cả hai đã bền vững | Event vẫn được gửi bình thường. Nhưng nếu client gọi lại sẽ tạo order thứ hai | Event không mất. Cần **idempotency key ở API** (outbox không giải quyết việc này) |
+| **② đọc/claim** (DB không trả lời, relay chết giữa chừng) | Relay biết lỗi (hoặc đã chết). Có thể một số dòng đã bị lease | Dòng vẫn `ProcessedOnUtc IS NULL` | Nhịp sau thử lại; dòng đã lease thì tự trở lại sau tối đa `ClaimLease` | Chỉ **trễ** |
+| **③ lỗi rõ ràng** (broker down, từ chối, đứt mạng trước khi tới broker) | Broker **không** có message. Relay **biết** (exception) | Dòng: `Attempts++`, `LastError`, `NextAttemptOnUtc = now + backoff` | Tự thử lại khi hết backoff (đã kiểm chứng kịch bản 2) | Chỉ **trễ**, không mất, không trùng |
+| **③/④ timeout hoặc mất ack** | Broker **có thể đã nhận**, relay **không biết** | Như dòng trên (relay coi là lỗi) | Gửi lại cùng `MessageId` | **Bản trùng**; inbox chặn (đã kiểm chứng kịch bản 3: broker nhận 4 lần, áp dụng 1 lần) |
+| **⑤ ghi `ProcessedOnUtc` thất bại** (DB lỗi, relay chết sau khi đã nhận ④) | Broker **đã có** message, nhưng DB outbox vẫn ghi "chưa gửi" | Dòng còn `PENDING`/`LEASED` | Dòng quay về `PENDING` khi relay nhả lease ở nhịp sau, hoặc muộn nhất khi lease hết hạn; rồi gửi lại | **Bản trùng**; inbox chặn. Đây là trường hợp "lỗi khi ghi ack về DB" |
+| **⑥ giao cho consumer** (consumer down, đứt mạng) | Relay đã xong phần của mình | Message nằm trong broker | Broker giữ (hàng đợi bền) và giao khi consumer trở lại | Chỉ **trễ**. Outbox không liên quan nữa |
+| **⑦ transaction của consumer** (lỗi, chết giữa chừng) | Rollback cả inbox lẫn stock; consumer chưa ack ⑧ | Inbox không có `MessageId`, stock chưa đổi | Broker giao lại message chưa được ack | Chỉ **trễ**. Lỗi nghiệp vụ (hết hàng, SKU lạ) **không** phải lỗi: vẫn commit inbox rồi ack |
+| **⑧ ack của consumer mất** (consumer chết sau COMMIT, trước khi ack) | DB consumer **đã commit**, broker **không biết** | Inbox đã có `MessageId`, stock đã trừ | Broker giao lại | **Bản trùng**; `INSERT inbox` vi phạm khoá chính nên bị bỏ qua, rồi ack lại (đã kiểm chứng kịch bản 3, 6) |
+| **Lease hết hạn khi relay chỉ chậm** (không chết) | Hai relay cùng giữ một dòng | Dòng được publish bởi cả hai | — | **Bản trùng**; inbox chặn. Tăng `ClaimLease` hoặc giảm `BatchSize` để hiếm hơn |
+
+Rút ra ba kết luận từ bảng:
+
+1. **Không có đường nào dẫn tới "mất" hay "ma".** Mất event cần dòng outbox biến mất hoặc bị đánh dấu xong khi broker chưa nhận, nhưng ⑤ chỉ chạy sau ④. Event ma cần event tồn tại khi order không tồn tại, nhưng ① là một transaction.
+2. **Mọi lỗi ở sau ① chỉ có hai hệ quả: trễ hoặc trùng.** "Trễ" thì tự hết khi hạ tầng hồi phục. "Trùng" thì bị inbox chặn.
+3. **Bản trùng không phải lỗi cần ngăn mà là cái giá chấp nhận được**: các cặp "không biết đã xảy ra chưa" (③/④, ⑤, ⑧) không thể loại bỏ trên mạng không tin cậy, nên thay vì cố ngăn trùng ở relay, ta làm consumer **idempotent**.
 
 ### 4.6 Những lỗi hay gặp khi tự cài outbox
 
@@ -286,7 +381,7 @@ Client      Orders API            DB                    Relay            Broker 
 2. **Gọi `SaveChanges` hai lần** (một cho entity, một cho outbox) → hai transaction → lại có khoảng hở.
 3. **Vẫn publish thẳng trong request "cho nhanh"** rồi coi outbox là dự phòng → quay lại dual-write có lỗ hổng. Nếu muốn giảm độ trễ, hãy *đánh thức relay* sau commit, đừng publish song song.
 4. **Đánh dấu "đã gửi" trước khi publish** → at-most-once, mất event khi crash.
-5. **Không có timeout khi publish** → giữ transaction/lock vô hạn khi broker treo.
+5. **Không có timeout khi publish** → relay đứng vô hạn khi broker treo (và nếu relay giữ transaction/khoá thì giữ cả khoá vô hạn). Ngược lại, **lease ngắn hơn thời gian xử lý một lô** → relay khác nhặt trùng.
 6. **Tạo `MessageId` mới mỗi lần gửi lại** → consumer không thể khử trùng lặp. `Id` phải cố định theo dòng outbox.
 7. **Retry không backoff** → bão request khi broker vừa hồi phục.
 8. **Quên inbox/idempotency ở consumer.**
@@ -297,7 +392,7 @@ Client      Orders API            DB                    Relay            Broker 
 
 1. Tạo bảng outbox trong **cùng DB nghiệp vụ**, kèm filtered index cho dòng chưa xử lý.
 2. Mọi use case cần phát event: thêm dòng outbox vào **cùng DbContext, cùng một lần lưu**.
-3. Viết relay: claim bằng row-lock → publish (timeout, chờ ack) → đánh dấu → commit; lỗi thì backoff.
+3. Viết relay: claim bằng lease (UPDATE nguyên tử có điều kiện) → publish ngoài transaction (timeout, chờ ack) → đánh dấu đã gửi; lỗi thì backoff.
 4. Gắn `MessageId` cố định vào message.
 5. Consumer: ghi inbox (PK) + tác dụng nghiệp vụ trong **một transaction**.
 6. Dọn dẹp định kỳ; giám sát backlog, tuổi message cũ nhất, số lần thử.
@@ -336,14 +431,14 @@ Thứ ta làm được là **effectively-once** = *at-least-once* + *xử lý id
 4. **Tách độ sẵn sàng:** service vẫn nhận request khi broker sập, và request không chịu độ trễ của broker (đã kiểm chứng).
 5. **Không phụ thuộc loại broker.** Đổi RabbitMQ sang Kafka chỉ đổi `IMessagePublisher`.
 6. **Dễ quan sát và audit:** bảng outbox là nhật ký các event; replay thủ công chỉ cần đặt lại `ProcessedOnUtc = NULL`.
-7. **Scale ngang được** bằng row-lock hoặc partition (mục 9).
+7. **Scale ngang được** bằng lease hoặc row-lock, hay partition (mục 9).
 8. **Nhất quán nội tại kể cả khi DB mất dữ liệu** (vd. failover với replication bất đồng bộ): order và event mất *cùng nhau* vì chung một transaction.
 
 ### Nhược điểm
 
 1. **At-least-once → bản trùng**, bắt buộc consumer idempotent (thêm bảng inbox và logic).
 2. **Độ trễ:** với polling, event đến muộn tới một chu kỳ quét (mặc định 1s). Hệ thống eventually consistent; UI không được giả định kho đã cập nhật ngay sau khi tạo order.
-3. **Thêm tải lên DB nghiệp vụ:** mỗi event tốn thêm 1 `INSERT` + 1 `UPDATE` (+ 1 `DELETE` khi dọn), cộng truy vấn polling liên tục, cộng dung lượng.
+3. **Thêm tải lên DB nghiệp vụ:** mỗi event tốn thêm 1 `INSERT` + 2 `UPDATE` (lease, đánh dấu đã gửi) (+ 1 `DELETE` khi dọn), cộng truy vấn polling liên tục, cộng dung lượng.
 4. **Thêm một thành phần phải vận hành** (relay): backlog, poison message, dead-letter, cảnh báo.
 5. **Thứ tự khó giữ** khi có nhiều relay hoặc retry (mục 9, case P2).
 6. **Phải có store giao dịch:** nếu store không có transaction đa bản ghi thì phải nhúng outbox vào document hoặc dùng change stream.
@@ -410,17 +505,18 @@ Giữ polling làm lưới an toàn, nhưng bổ sung tín hiệu để giảm �
 
 Project này tự cài để bạn thấy từng cơ chế. Ở production nên cân nhắc thư viện đã được kiểm chứng có sẵn outbox/inbox, như MassTransit (EF Core outbox), NServiceBus (Outbox), Wolverine (durable inbox/outbox) hoặc CAP (DotNetCore.CAP). **Hãy kiểm tra license và phiên bản hiện hành** của từng thư viện trước khi chọn.
 
-### 8.5 Cách claim: khoá trong transaction hay lease
+### 8.5 Cách claim: lease (project này) hay khoá trong transaction
 
-| | Khoá trong transaction (project này) | Lease (cột `LockedBy`/`LockedUntil`) |
+| | Lease (project này) | Khoá trong transaction (`UPDLOCK, READPAST` / `SKIP LOCKED`) |
 |---|---|---|
-| Cách làm | `SELECT ... UPDLOCK, READPAST` → publish → `UPDATE` → `COMMIT` | `UPDATE ... SET LockedBy, LockedUntil ... OUTPUT inserted.*` (transaction ngắn) → publish **ngoài** transaction → `UPDATE ... WHERE Id AND LockedBy = @me` |
-| Instance chết | Connection đứt → DB tự nhả khoá ngay | Phải chờ lease hết hạn mới có người tiếp quản |
-| Giữ connection/khoá khi gọi broker | Có (cần timeout + lô nhỏ) | Không |
-| Trùng khi lease hết hạn trong lúc publish chậm | Không | Có thể |
-| Phụ thuộc | Cần `SKIP LOCKED`/`READPAST` | Chạy được trên DB không có `SKIP LOCKED` |
+| Cách làm | Đọc ứng viên → mỗi dòng `UPDATE ... SET NextAttemptOnUtc = now + lease WHERE Id AND NextAttemptOnUtc = @đã_đọc` (1 dòng bị ảnh hưởng = thắng) → publish **ngoài** transaction → `UPDATE ProcessedOnUtc` | `BEGIN` → `SELECT ... UPDLOCK, READPAST` → publish → `UPDATE` → `COMMIT` |
+| Giữ connection/khoá khi gọi broker | **Không** | Có (cần timeout + lô nhỏ, nếu không dễ cạn connection pool và gây lock-wait) |
+| Instance chết | Phải chờ lease hết hạn (`ClaimLease`) mới có người tiếp quản | Connection đứt → DB tự nhả khoá ngay |
+| Trùng khi lease hết hạn trong lúc publish chậm | Có thể (inbox chặn) | Không |
+| Phụ thuộc DB | Chỉ cần `UPDATE` nguyên tử có điều kiện; viết được bằng EF Core (`ExecuteUpdateAsync`), chạy trên mọi DB quan hệ | Cần `SKIP LOCKED`/`READPAST`, EF Core không có sẵn nên phải dùng SQL thô theo từng DB |
+| Số lệnh ghi cho mỗi event | 1 `INSERT` + 2 `UPDATE` (lease, processed) | 1 `INSERT` + 1 `UPDATE` |
 
-Câu truy vấn claim tương đương trên PostgreSQL:
+Project này đã chuyển từ cột phải sang cột trái vì không muốn giữ khoá DB trong lúc chờ mạng. Nếu cần quay lại cách khoá trong transaction, câu truy vấn claim tương đương trên PostgreSQL là:
 
 ```sql
 SELECT * FROM outbox_messages
@@ -452,7 +548,7 @@ Lưu ý với SQL Server: `READPAST` chỉ dùng được ở mức cô lập `R
                  ┌── Orders #1 (API + relay) ─┐
  Load balancer ─►├── Orders #2 (API + relay) ─┤──► [ DB: Orders + OutboxMessages ]  ◄─ dùng chung
                  └── Orders #3 (API + relay) ─┘            ▲
-                                  │                        └ row-lock (UPDLOCK/READPAST) để chia việc
+                                  │                        └ lease (UPDATE nguyên tử) để chia việc
                                   ▼ publish
                             [   Broker   ]
                                   │ giao cho các consumer cạnh tranh (competing consumers)
@@ -467,8 +563,8 @@ Khi nhân bản, **mỗi instance Orders đều chạy relay** và **mỗi insta
 
 **P1 — Nhiều relay đọc cùng một dòng → publish trùng.** ✅
 Không có phối hợp thì N relay cùng `SELECT` thấy cùng các dòng "chưa xử lý" và cùng publish.
-*Cách xử lý:* row-lock `UPDLOCK, READPAST` / `SKIP LOCKED` (project này); hoặc lease; hoặc leader election (chỉ một relay hoạt động, qua `sp_getapplock`/`pg_advisory_lock`/lease của Kubernetes); hoặc tách relay thành deployment riêng với 1 replica; hoặc CDC. Luôn giữ inbox làm lớp bảo vệ cuối.
-*Số liệu:* 3 instance, 300 order → **300 lần publish cho 300 message, 0 trùng**. Bỏ hint khoá khỏi cùng đoạn code → **699 lần publish, 220 message bị gửi trùng**; tồn kho vẫn đúng chỉ nhờ inbox. Nghĩa là khoá hàng chống *lãng phí và rối thứ tự*, inbox bảo vệ *tính đúng đắn*; hai lớp bổ sung cho nhau.
+*Cách xử lý:* lease bằng `UPDATE` nguyên tử có điều kiện (project này); hoặc row-lock `UPDLOCK, READPAST` / `SKIP LOCKED`; hoặc leader election (chỉ một relay hoạt động, qua `sp_getapplock`/`pg_advisory_lock`/lease của Kubernetes); hoặc tách relay thành deployment riêng với 1 replica; hoặc CDC. Luôn giữ inbox làm lớp bảo vệ cuối.
+*Số liệu:* test tự động `ManyRelaysClaimingTheSamePendingRows` chạy 4 relay trên 300 dòng pending → **300 lần publish cho 300 message, mỗi message đúng một relay, 0 trùng**. Với bản row-lock cũ, bỏ hint khoá khỏi cùng đoạn code → **699 lần publish, 220 message bị gửi trùng**; tồn kho vẫn đúng chỉ nhờ inbox. Nghĩa là cơ chế claim chống *lãng phí và rối thứ tự*, inbox bảo vệ *tính đúng đắn*; hai lớp bổ sung cho nhau.
 
 **P2 — Đảo thứ tự event của cùng một aggregate.** 📖
 Relay A đang giữ message #1 của order X (publish chậm hoặc lỗi và bị backoff), relay B claim message #2 của X và gửi trước ⇒ broker nhận #2 trước #1. Backoff theo từng dòng cũng gây đúng hiện tượng này kể cả chỉ có một relay.
@@ -486,13 +582,13 @@ Broker nhận: #2, rồi #1    ✗
 **P3 — Tải polling nhân theo số instance.** 📖
 N instance × 1 truy vấn/giây thì không đáng kể, nhưng 100 instance × quét mỗi 100ms thì có. *Xử lý:* jitter, polling thích ứng (ngủ lâu hơn khi rỗng), filtered index (project có), `LISTEN/NOTIFY`, chỉ vài instance chạy relay, hoặc CDC.
 
-**P4 — Giữ transaction/khoá trong lúc gọi mạng.** ◐
-Broker chậm ⇒ mỗi relay giữ một connection + row-lock lâu, connection pool của N instance cạn dần. *Xử lý:* `PublishTimeout`, lô nhỏ (`BatchSize`), dừng lô khi có lỗi (project có cả ba cơ chế, nhưng broker giả lập không bao giờ chậm nên chưa thử trong điều kiện thật), hoặc dùng lease để transaction ngắn.
+**P4 — Giữ transaction/khoá trong lúc gọi mạng.** ✅
+Với lease, relay không giữ transaction hay khoá nào khi gọi broker, nên broker chậm chỉ làm relay đó chậm, không cạn connection pool hay gây lock-wait trên DB nghiệp vụ. Vẫn cần `PublishTimeout` (để relay không đứng vô hạn), lô nhỏ (`BatchSize`) và dừng lô khi có lỗi. Cái giá: nếu một lô chạy lâu hơn `ClaimLease` thì lease hết hạn và relay khác publish trùng (inbox chặn).
 
-**P5 — Instance chết hoặc bị thay thế (rolling deploy, autoscale-in, spot).** ✅
-- *Chết đột ngột:* kill -9 một instance khi nó đang giữ lô chưa commit ⇒ DB rollback, khoá được nhả, instance còn lại **tự tiếp quản**; kết quả cuối `200/200`, kho `800` (đúng). Những message mà instance chết đã kịp publish được gửi lại và bị inbox chặn (10 bản trùng trong lần thử).
-- *Tắt êm:* nhận tín hiệu dừng giữa lô ⇒ relay commit những message đã gửi, nhả phần còn lại; khi khởi động lại không phát sinh bản trùng.
-- Với lease: thời gian tiếp quản = TTL của lease.
+**P5 — Instance chết hoặc bị thay thế (rolling deploy, autoscale-in, spot).** ◐
+- *Chết đột ngột:* không còn transaction để DB rollback, nên các dòng relay đó đã lease sẽ **tự trở lại `PENDING` khi lease hết hạn** (`ClaimLease`) và instance còn lại nhặt lên. Những message đã kịp publish trước khi chết sẽ bị gửi lại và bị inbox chặn. (Kịch bản `kill -9` trong mục 10 được đo với bản row-lock cũ, nơi DB nhả khoá ngay; chưa đo lại với lease.)
+- *Tắt êm:* nhận tín hiệu dừng giữa lô ⇒ relay ghi kết quả những message đã gửi và trả lease phần còn lại ngay, nên instance khác nhặt được mà không phải chờ lease hết hạn.
+- Thời gian tiếp quản sau khi chết đột ngột = `ClaimLease`.
 
 **P6 — Poison message.** 📖 (cơ chế backoff đã chạy, dead-letter thì chưa có)
 Một message luôn lỗi (payload sai, bị broker từ chối vĩnh viễn). Với backoff theo dòng + dừng lô, nó không chặn cả hàng đợi nhưng tốn một lần thử mỗi chu kỳ backoff. *Cần thêm ở production:* giới hạn số lần cho **lỗi không thể thử lại** rồi chuyển dead-letter + cảnh báo. Lưu ý phân biệt *lỗi tạm thời* (broker sập, tuyệt đối không dead-letter) với *lỗi vĩnh viễn*.
@@ -550,11 +646,11 @@ Scale consumer theo độ dài hàng đợi/độ trễ; sau khi broker hồi ph
 
 | Case | Hiện tượng | Xử lý chính | Trong project |
 |---|---|---|---|
-| P1 | Nhiều relay publish trùng | Row-lock `SKIP LOCKED`/lease/leader + inbox | ✅ Có (UPDLOCK/READPAST) |
+| P1 | Nhiều relay publish trùng | Lease (CAS)/row-lock/leader + inbox | ✅ Có (lease bằng `ExecuteUpdateAsync`) |
 | P2 | Đảo thứ tự | Version, claim loại trừ, partition relay | ❌ Không bảo đảm thứ tự |
 | P3 | Tải polling | Jitter, notify, ít relay, CDC | ◐ Chỉ có filtered index |
-| P4 | Giữ khoá khi gọi mạng | Timeout, lô nhỏ, lease | ◐ Có timeout + dừng lô (chưa thử broker chậm thật) |
-| P5 | Instance chết/deploy | Khoá tự nhả; tắt êm | ✅ Cả hai |
+| P4 | Giữ khoá khi gọi mạng | Không giữ khoá (lease), timeout, lô nhỏ | ✅ Không còn giữ khoá/transaction lúc publish |
+| P5 | Instance chết/deploy | Lease tự hết hạn; tắt êm trả lease | ◐ Cả hai có trong code, chưa đo lại sau khi đổi sang lease |
 | P6 | Poison message | Backoff, dead-letter, cảnh báo | ◐ Backoff, chưa có dead-letter |
 | P7 | Bảng phình | Dọn dẹp, partition | ✅ Cleanup |
 | P8 | Lệch đồng hồ | Dùng giờ DB | ❌ Dùng giờ ứng dụng |
@@ -568,6 +664,8 @@ Scale consumer theo độ dài hàng đợi/độ trễ; sau khi broker hồi ph
 
 Đo trên một máy phát triển (Windows 11, SQL Server LocalDB, .NET 10), mỗi kịch bản chạy bằng chính code trong repo. Số liệu cụ thể (đặc biệt phân bố việc giữa các instance và số bản trùng khi bỏ khoá) thay đổi theo từng lần chạy.
 
+> **Lưu ý về phiên bản code:** các kịch bản 5b, 6, 7 được đo khi relay còn dùng row-lock (`UPDLOCK, READPAST`). Sau khi relay chuyển sang claim bằng lease, bộ test tự động (mục 11) đã được chạy lại và pass 10/10, trong đó có test 4 relay tranh nhau 300 dòng outbox mà mỗi message chỉ được publish đúng một lần. Các kịch bản chạy tay 5b, 6, 7 **chưa được đo lại** với bản lease.
+
 | # | Kịch bản | Kết quả đo được |
 |---|---|---|
 | 1 | Luồng cơ bản | `POST /orders` → outbox → relay → consumer; kho `SKU-001`: 1000 → 998 |
@@ -576,9 +674,9 @@ Scale consumer theo độ dài hàng đợi/độ trễ; sau khi broker hồi ph
 | 4a | Dual-write ngây thơ khi broker sập | HTTP 500, order **đã lưu**, outbox trống, event mất vĩnh viễn |
 | 4b | Outbox khi broker sập | HTTP 201, event được giao bù khi broker hồi phục |
 | 5 | 3 instance, cùng DB | 300 order → 300/300 publish, 0 trùng. 1000 order → 1000/1000, 0 trùng. Kho khớp tuyệt đối |
-| 5b | **Đối chứng âm:** bỏ `UPDLOCK, READPAST, ROWLOCK` | 699 lần publish cho 300 message; **220 message bị gửi trùng**; kho vẫn đúng nhờ inbox |
-| 6 | `kill -9` một instance giữa lô | Instance còn lại tiếp quản; 200/200 xử lý, kho 800; 10 message được publish lại, 10 bản trùng bị inbox chặn |
-| 7 | Tắt êm giữa lô | Commit đúng 12 message đã gửi, nhả 88 còn lại; không trùng khi khởi động lại; không có exception |
+| 5b | **Đối chứng âm:** bỏ `UPDLOCK, READPAST, ROWLOCK` (bản row-lock cũ) | 699 lần publish cho 300 message; **220 message bị gửi trùng**; kho vẫn đúng nhờ inbox |
+| 6 | `kill -9` một instance giữa lô (bản row-lock cũ) | Instance còn lại tiếp quản; 200/200 xử lý, kho 800; 10 message được publish lại, 10 bản trùng bị inbox chặn |
+| 7 | Tắt êm giữa lô (bản row-lock cũ) | Commit đúng 12 message đã gửi, nhả 88 còn lại; không trùng khi khởi động lại; không có exception |
 | 8 | Dọn dẹp | Outbox 5 → 0, inbox 5 → 0 sau khi hết retention |
 | 9 | Log SQL | Một transaction, một batch chứa cả `INSERT Orders` lẫn `INSERT OutboxMessages` |
 | 10 | Biên | Request lỗi (400/404) không để lại dòng nào; SKU lạ xử lý đúng một lần; `/demo/*` trả 404 ngoài Development |
@@ -631,9 +729,9 @@ dotnet test          # ~10 giây
 - **Không bảo đảm thứ tự** giữa các message/instance (P2).
 - **Không có dead-letter** cho poison message (P6); consumer requeue vô hạn.
 - **`EnsureCreated`** thay cho migrations, và có race nếu hai instance khởi động cùng lúc trên DB chưa tồn tại.
-- **SQL claim viết riêng cho SQL Server** (`UPDLOCK, READPAST`); PostgreSQL cần `FOR UPDATE SKIP LOCKED`.
+- **Claim bằng lease có độ trễ tiếp quản:** relay chết thì các dòng đã lease chỉ được nhặt lại sau `ClaimLease` (mặc định 60 giây); relay chậm hơn lease thì gây bản trùng (inbox chặn).
 - Nghiệp vụ nằm thẳng trong controller; chưa có xác thực, idempotency key ở API.
-- Test tự động (mục 11) mới phủ các kịch bản 1, 2, 3, 4b, 5, 9 và phần request lỗi của 10 trong mục 10; chưa có test cho 4a (dual-write ngây thơ), 5b (đối chứng bỏ khoá), 6 (`kill -9`), 7 (tắt êm), 8 (dọn dẹp) và các endpoint `/demo/*`.
+- Test tự động (mục 11) mới phủ các kịch bản 1, 2, 3, 4b, 5, 9 và phần request lỗi của 10 trong mục 10; chưa có test cho 4a (dual-write ngây thơ), 5b (đối chứng bỏ cơ chế claim), 6 (`kill -9`), 7 (tắt êm), 8 (dọn dẹp) và các endpoint `/demo/*`.
 - Giờ ứng dụng (không phải giờ DB) được dùng cho `NextAttemptOnUtc`.
 
 ### Checklist production
@@ -660,4 +758,4 @@ dotnet test          # ~10 giây
 - Gunnar Morling — [Reliable Microservices Data Exchange With the Outbox Pattern](https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/) và tài liệu [Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) của Debezium.
 - Gregor Hohpe — [Your Coffee Shop Doesn't Use Two-Phase Commit](https://www.enterpriseintegrationpatterns.com/ramblings/18_starbucks.html).
 - Pat Helland — *Life beyond Distributed Transactions: an Apostate's Opinion* (CIDR 2007): nền tảng lý thuyết cho việc thay giao dịch phân tán bằng "thực thể + thông điệp + idempotence".
-- Microsoft Learn — [Table hints (T-SQL)](https://learn.microsoft.com/en-us/sql/t-sql/queries/hints-transact-sql-table) (`UPDLOCK`, `READPAST`, `ROWLOCK`); PostgreSQL — [SELECT … FOR UPDATE SKIP LOCKED](https://www.postgresql.org/docs/current/sql-select.html).
+- Microsoft Learn — [ExecuteUpdate và ExecuteDelete (EF Core)](https://learn.microsoft.com/en-us/ef/core/saving/execute-insert-update-delete) (cập nhật nguyên tử không qua change tracker, dùng cho claim bằng lease); PostgreSQL — [SELECT … FOR UPDATE SKIP LOCKED](https://www.postgresql.org/docs/current/sql-select.html) (cách claim thay thế bằng khoá hàng).

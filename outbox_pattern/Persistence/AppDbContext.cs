@@ -38,7 +38,6 @@ namespace outbox_pattern.Persistence
 
             modelBuilder.Entity<OutboxMessage>(outbox =>
             {
-                // Tên bảng được viết cứng vì OutboxProcessor truy vấn bằng SQL thô.
                 outbox.ToTable("OutboxMessages");
                 outbox.HasKey(m => m.Id);
                 outbox.Property(m => m.Id).ValueGeneratedNever();
