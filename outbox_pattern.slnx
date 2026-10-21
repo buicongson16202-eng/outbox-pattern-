@@ -1,4 +1,6 @@
 <Solution>
   <Project Path="outbox_pattern/outbox_pattern.csproj" />
+  <Project Path="outbox_pattern.MassTransitDemo/outbox_pattern.MassTransitDemo.csproj" />
+  <Project Path="outbox_pattern.MassTransitDemo.Tests/outbox_pattern.MassTransitDemo.Tests.csproj" />
   <Project Path="outbox_pattern.Tests/outbox_pattern.Tests.csproj" />
 </Solution>

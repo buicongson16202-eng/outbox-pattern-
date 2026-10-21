@@ -1,0 +1,78 @@
+@host = http://localhost:5200
+
+# =====================================================================
+#  OUTBOX PATTERN BẰNG MASSTRANSIT  (xem docs/masstransit.md)
+#  Các endpoint /demo chỉ hoạt động khi ASPNETCORE_ENVIRONMENT=Development.
+#  Swagger UI: http://localhost:5200/swagger
+# =====================================================================
+
+### 0) Xem toàn bộ trạng thái: order, OutboxMessage/OutboxState/InboxState của MassTransit, tồn kho
+GET {{host}}/demo/state
+
+### 1) KỊCH BẢN CƠ BẢN: tạo order.
+#    Order + OutboxMessage + OutboxState được ghi trong CÙNG một transaction. Ngay sau khi commit, MassTransit đánh thức dịch vụ
+#    giao outbox, nó gửi message ra transport rồi XOÁ dòng outbox; consumer ghi InboxState và trừ kho. Gọi lại (0) để xem.
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-001", "quantity": 2, "customerEmail": "a@example.com" }
+
+### 2) KỊCH BẢN TRANSPORT SẬP: tắt transport, tạo order, quan sát, rồi bật lại.
+#    Order vẫn tạo thành công (201). outbox.waitingMessages = 1 và tồn kho CHƯA đổi; log có "Outbox Send Fault" lặp lại.
+#    Bật lại -> dịch vụ giao outbox tự gửi bù -> tồn kho được trừ. Không mất event nào.
+PUT {{host}}/demo/transport/down
+
+###
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-002", "quantity": 5, "customerEmail": "b@example.com" }
+
+###
+GET {{host}}/demo/state
+
+###
+PUT {{host}}/demo/transport/up
+
+### 3) KỊCH BẢN TRANSPORT TREO: mọi lần gửi chờ vô hạn. Trong lúc treo, dịch vụ giao outbox GIỮ khoá dòng OutboxState.
+#    Xem trong SSMS: SELECT * FROM sys.dm_tran_locks WHERE resource_database_id = DB_ID() AND request_mode IN ('U','X')
+PUT {{host}}/demo/transport/hang
+
+###
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-003", "quantity": 1, "customerEmail": "c@example.com" }
+
+###
+PUT {{host}}/demo/transport/up
+
+### 4) KỊCH BẢN BẢN TRÙNG (at-least-once): đưa CÙNG MỘT message (cùng MessageId) vào outbox 5 lần.
+#    Consumer nhận cả 5 lần nhưng inbox chặn: tồn kho chỉ bị trừ ĐÚNG MỘT lần, chỉ có một dòng InboxState.
+POST {{host}}/demo/orders-duplicate?copies=5
+Content-Type: application/json
+
+{ "sku": "SKU-001", "quantity": 3, "customerEmail": "d@example.com" }
+
+### 5) KỊCH BẢN CONSUMER LỖI TẠM THỜI: consumer ném lỗi 2 lần rồi thành công (retry 3 lần: 100 ms, 500 ms, 1 s).
+#    Tồn kho chỉ bị trừ một lần vì mỗi lần lỗi rollback cả InboxState. Log có "R-RETRY".
+PUT {{host}}/demo/consumer/fail?times=2
+
+###
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-002", "quantity": 1, "customerEmail": "e@example.com" }
+
+### 6) KỊCH BẢN CONSUMER LỖI MÃI: vượt quá số lần retry -> message bị đẩy sang hàng OrderCreated_error (in-memory: mất khi
+#    tắt process). Tồn kho không đổi. Log có "R-FAULT". Tắt lại công tắc sau khi xem xong.
+PUT {{host}}/demo/consumer/fail?times=100
+
+###
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "sku": "SKU-003", "quantity": 1, "customerEmail": "f@example.com" }
+
+###
+PUT {{host}}/demo/consumer/fail?times=0
