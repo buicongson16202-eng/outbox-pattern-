@@ -4,10 +4,9 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using outbox_pattern.MassTransitDemo.Controllers;
-using outbox_pattern.MassTransitDemo.Inventory;
-using outbox_pattern.MassTransitDemo.Messaging;
-using outbox_pattern.MassTransitDemo.Persistence;
+using outbox_pattern.MassTransitDemo.Api.Controllers;
+using outbox_pattern.MassTransitDemo.Infrastructure.Demo;
+using outbox_pattern.MassTransitDemo.Infrastructure.Persistence;
 
 namespace outbox_pattern.MassTransitDemo.Tests.Infrastructure;
 
@@ -22,7 +21,7 @@ public sealed class DemoApiFactory(string connectionString, bool logSql = false)
 {
     static DemoApiFactory()
     {
-        // Program.cs đọc mục "Outbox" NGAY khi khởi động (trước khi factory kịp thêm nguồn cấu hình), nên các giá trị này phải
+        // AddInfrastructure (gọi từ Program.cs) đọc mục "Outbox" NGAY khi khởi động (trước khi factory kịp thêm nguồn cấu hình), nên các giá trị này phải
         // đi qua biến môi trường — nguồn mà WebApplication.CreateBuilder nạp sẵn. (Connection string thì được đọc muộn hơn nên
         // đặt được qua ConfigureAppConfiguration bên dưới.)
         SetIfMissing("Outbox__QueryDelay", "00:00:00.100");

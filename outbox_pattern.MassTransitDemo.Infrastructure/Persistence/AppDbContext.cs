@@ -1,10 +1,16 @@
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
-using outbox_pattern.MassTransitDemo.Domain;
+using outbox_pattern.MassTransitDemo.Application.Abstractions;
+using outbox_pattern.MassTransitDemo.Domain.Inventory;
+using outbox_pattern.MassTransitDemo.Domain.Orders;
 
-namespace outbox_pattern.MassTransitDemo.Persistence
+namespace outbox_pattern.MassTransitDemo.Infrastructure.Persistence
 {
-    public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
+    /// <summary>
+    /// Một DbContext cho cả dữ liệu nghiệp vụ lẫn ba bảng của MassTransit — điều kiện bắt buộc để Order và message nằm trong
+    /// CÙNG một transaction. Nó cũng chính là <see cref="IUnitOfWork"/> của Application (SaveChangesAsync = commit cả hai).
+    /// </summary>
+    public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options), IUnitOfWork
     {
         public DbSet<Order> Orders => Set<Order>();
 
@@ -17,19 +23,19 @@ namespace outbox_pattern.MassTransitDemo.Persistence
                 order.ToTable("Orders");
                 order.HasKey(o => o.Id);
                 order.Property(o => o.Id).ValueGeneratedNever();
-                order.Property(o => o.Sku).HasMaxLength(50);
-                order.Property(o => o.CustomerEmail).HasMaxLength(320);
+                order.Property(o => o.Sku).HasMaxLength(Order.MaxSkuLength);
+                order.Property(o => o.CustomerEmail).HasMaxLength(Order.MaxEmailLength);
             });
 
             modelBuilder.Entity<StockItem>(stock =>
             {
                 stock.ToTable("StockItems");
                 stock.HasKey(s => s.Sku);
-                stock.Property(s => s.Sku).HasMaxLength(50);
+                stock.Property(s => s.Sku).HasMaxLength(Order.MaxSkuLength);
                 stock.HasData(
-                    new StockItem { Sku = "SKU-001", Available = 1000 },
-                    new StockItem { Sku = "SKU-002", Available = 1000 },
-                    new StockItem { Sku = "SKU-003", Available = 1000 });
+                    new StockItem("SKU-001", 1000),
+                    new StockItem("SKU-002", 1000),
+                    new StockItem("SKU-003", 1000));
             });
 
             // Ba bảng do MassTransit sở hữu (không cần tự viết entity/relay/inbox):

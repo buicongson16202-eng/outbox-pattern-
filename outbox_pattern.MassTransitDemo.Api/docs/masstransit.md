@@ -1,6 +1,6 @@
 # Outbox Pattern bằng MassTransit — giải thích và cách áp dụng trong project này
 
-Tài liệu đi kèm project [outbox_pattern.MassTransitDemo](..). Nó làm **đúng bài toán** của project `outbox_pattern` (POST /orders → event `OrderCreated` → Inventory trừ kho), nhưng thay toàn bộ phần tự viết (bảng outbox, relay, inbox, dọn dẹp) bằng outbox/inbox có sẵn của **MassTransit**.
+Tài liệu đi kèm bộ project `outbox_pattern.MassTransitDemo.*` — tổ chức theo **Clean Architecture** thành bốn project Api, Application, Domain, Infrastructure (xem [mục 2.3](#23-cấu-trúc-solution-clean-architecture)). Nó làm **đúng bài toán** của project `outbox_pattern` (POST /orders → event `OrderCreated` → Inventory trừ kho), nhưng thay toàn bộ phần tự viết (bảng outbox, relay, inbox, dọn dẹp) bằng outbox/inbox có sẵn của **MassTransit**.
 
 Lý thuyết nền (dual-write, ACID, 2PC, at-least-once, vì sao cần inbox) **không nhắc lại** ở đây. Xem [OUTBOX_PATTERN.md](../../outbox_pattern/docs/OUTBOX_PATTERN.md) mục 1–5. Tài liệu này tập trung vào: MassTransit làm những bước đó thế nào, khác bản tự viết ở đâu, và các bẫy khi dùng.
 
@@ -27,7 +27,7 @@ Quy ước giống tài liệu kia: chỗ ghi **"đã kiểm chứng"** là kế
 ## 0. Tóm tắt 30 giây
 
 - **Cùng một ý tưởng:** ghi dữ liệu nghiệp vụ *và* message vào **cùng một transaction** của DB; một tiến trình nền gửi message sang broker sau khi commit; consumer dùng **inbox** để xử lý mỗi message đúng một lần.
-- **Khác ở chỗ ai viết code:** bạn chỉ (1) thêm ba bảng của MassTransit vào `DbContext`, (2) bật `AddEntityFrameworkOutbox(... UseBusOutbox())`, (3) bật `UseEntityFrameworkOutbox` cho consumer. Controller gọi `IPublishEndpoint.Publish(...)` rồi `SaveChangesAsync()` như bình thường. Relay, inbox, dọn dẹp, retry, hàng lỗi đều do MassTransit làm.
+- **Khác ở chỗ ai viết code:** bạn chỉ (1) thêm ba bảng của MassTransit vào `DbContext`, (2) bật `AddEntityFrameworkOutbox(... UseBusOutbox())`, (3) bật `UseEntityFrameworkOutbox` cho consumer. Use case gọi cổng `IOrderEventPublisher` (cài bằng `IPublishEndpoint.Publish(...)`) rồi `IUnitOfWork.SaveChangesAsync()` như bình thường. Relay, inbox, dọn dẹp, retry, hàng lỗi đều do MassTransit làm.
 - **Cái giá:** thêm một thư viện lớn và các quy ước của nó; ít quan sát hơn bản tự viết (không có cột `Attempts`/`LastError`); và **từ v9 MassTransit là sản phẩm thương mại** — project này dùng v8 (Apache-2.0).
 
 ```
@@ -74,16 +74,16 @@ API dùng trong project (`AddEntityFrameworkOutbox`, `UseBusOutbox`, `UseEntityF
 
 | Thành phần | Vai trò | Trong project |
 |---|---|---|
-| Ba bảng `OutboxMessage`, `OutboxState`, `InboxState` | Lưu message chờ gửi và sổ "đã nhận" | `modelBuilder.AddInboxStateEntity()` … trong [AppDbContext.cs](../Persistence/AppDbContext.cs) |
-| **Bus outbox** (producer) | `IPublishEndpoint.Publish` ghi message vào `DbContext` thay vì gửi thẳng | `UseBusOutbox()` trong [Program.cs](../Program.cs); dùng ở [OrdersController.cs](../Controllers/OrdersController.cs) |
+| Ba bảng `OutboxMessage`, `OutboxState`, `InboxState` | Lưu message chờ gửi và sổ "đã nhận" | `modelBuilder.AddInboxStateEntity()` … trong [AppDbContext.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Persistence/AppDbContext.cs) |
+| **Bus outbox** (producer) | `IPublishEndpoint.Publish` ghi message vào `DbContext` thay vì gửi thẳng | `UseBusOutbox()` trong [DependencyInjection.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/DependencyInjection.cs); dùng ở [MassTransitOrderEventPublisher.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Messaging/MassTransitOrderEventPublisher.cs) |
 | **BusOutboxDeliveryService** (relay) | Hosted service đọc outbox, gửi ra transport, xoá dòng đã gửi | MassTransit tự đăng ký khi gọi `AddEntityFrameworkOutbox` |
-| **Consumer outbox / inbox** (middleware) | Bọc consumer trong transaction + ghi `InboxState` để khử trùng lặp | `endpoint.UseEntityFrameworkOutbox<AppDbContext>(context)` trong Program.cs |
+| **Consumer outbox / inbox** (middleware) | Bọc consumer trong transaction + ghi `InboxState` để khử trùng lặp | `endpoint.UseEntityFrameworkOutbox<AppDbContext>(context)` trong DependencyInjection.cs |
 | **InboxCleanupService** | Xoá `InboxState` cũ hơn `DuplicateDetectionWindow` | MassTransit tự đăng ký |
-| Retry + hàng `_error` | Consumer lỗi thì thử lại; hết lượt thì message sang hàng `<tên>_error` | `endpoint.UseMessageRetry(...)` trong Program.cs |
-| Consumer | Nghiệp vụ trừ kho, **không** chứa code inbox/transaction | [OrderCreatedConsumer.cs](../Inventory/OrderCreatedConsumer.cs) |
+| Retry + hàng `_error` | Consumer lỗi thì thử lại; hết lượt thì message sang hàng `<tên>_error` | `endpoint.UseMessageRetry(...)` trong DependencyInjection.cs |
+| Consumer | Adapter nhận message rồi gọi use case trừ kho, **không** chứa code inbox/transaction | [OrderCreatedConsumer.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Messaging/OrderCreatedConsumer.cs) → [ReserveStock.cs](../../outbox_pattern.MassTransitDemo.Application/Inventory/ReserveStock.cs) |
 | Transport | Broker. Demo dùng in-memory | `x.UsingInMemory(...)` |
 
-Hai công tắc chỉ phục vụ demo: [TransportSwitch.cs](../Messaging/TransportSwitch.cs) (giả lập transport sập/treo) và [ConsumerFaults.cs](../Inventory/ConsumerFaults.cs) (bắt consumer ném lỗi). Cả hai được điều khiển qua `/demo/*`.
+Hai công tắc chỉ phục vụ demo: [TransportSwitch.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Demo/TransportSwitch.cs) (giả lập transport sập/treo) và [ConsumerFaults.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Demo/ConsumerFaults.cs) (bắt consumer ném lỗi). Cả hai được điều khiển qua `/demo/*`.
 
 ### 2.2 Ba bảng (cột quan sát được trên SQL Server)
 
@@ -94,6 +94,55 @@ Hai công tắc chỉ phục vụ demo: [TransportSwitch.cs](../Messaging/Transp
 | `InboxState` | `Id` (identity), `MessageId` + `ConsumerId` (duy nhất), `LockId`, `RowVersion`, `Received`, `ReceiveCount`, `Consumed`, `Delivered`, `ExpirationTime`… | Sổ "consumer này đã nhận message này". `Consumed`/`Delivered` có giá trị = đã xử lý xong |
 
 So với bảng `OutboxMessages` tự viết: **không có** `Attempts`, `LastError`, `NextAttemptOnUtc`, và **dòng bị xoá ngay sau khi giao** (✅ đã kiểm chứng) chứ không giữ lại 7 ngày.
+
+### 2.3 Cấu trúc solution: Clean Architecture
+
+```
+outbox_pattern.MassTransitDemo.Api            Controller HTTP mỏng + Program.cs (composition root)
+        │  tham chiếu
+        ├──────────────► outbox_pattern.MassTransitDemo.Application      Use case + các "cổng" (interface)
+        │                         │  tham chiếu
+        │                         ▼
+        │                outbox_pattern.MassTransitDemo.Domain           Entity + quy tắc nghiệp vụ, không phụ thuộc gì
+        │                         ▲
+        └──────────────► outbox_pattern.MassTransitDemo.Infrastructure  EF Core + MassTransit: cài đặt các cổng
+                                  (tham chiếu Application, qua đó tới Domain)
+```
+
+**Quy tắc phụ thuộc:** mũi tên chỉ hướng **vào trong**. Domain không biết gì về tầng khác. Application chỉ biết Domain, **không** biết EF Core hay MassTransit. Infrastructure cài đặt các interface mà Application khai báo. Api chỉ nối mọi thứ lại và dịch HTTP ↔ use case. Quy tắc này được kiểm tra tự động bằng [ArchitectureTests.cs](../../outbox_pattern.MassTransitDemo.Tests/Unit/ArchitectureTests.cs) (đọc danh sách assembly mà mỗi tầng thực sự dùng).
+
+| Project | Chứa gì | Phụ thuộc |
+|---|---|---|
+| **Domain** | [Order.cs](../../outbox_pattern.MassTransitDemo.Domain/Orders/Order.cs) (chỉ tạo được qua `Order.Create`, tự kiểm tra bất biến), [StockItem.cs](../../outbox_pattern.MassTransitDemo.Domain/Inventory/StockItem.cs), `DomainException` | Không gì cả |
+| **Application** | Cổng: `IOrderRepository`, `IStockRepository`, `IOrderEventPublisher`, `IUnitOfWork` ([Ports.cs](../../outbox_pattern.MassTransitDemo.Application/Abstractions/Ports.cs)). Use case: [CreateOrderHandler](../../outbox_pattern.MassTransitDemo.Application/Orders/CreateOrder.cs), `GetOrderHandler`, [ReserveStockHandler](../../outbox_pattern.MassTransitDemo.Application/Inventory/ReserveStock.cs) | Domain; `Microsoft.Extensions.DependencyInjection.Abstractions` (chỉ để đăng ký DI) |
+| **Infrastructure** | `AppDbContext` (đồng thời là `IUnitOfWork`), repository, hợp đồng message `OrderCreated`, `MassTransitOrderEventPublisher`, `OrderCreatedConsumer`, cấu hình MassTransit ([DependencyInjection.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/DependencyInjection.cs)), công cụ demo | Application; EF Core SQL Server, MassTransit |
+| **Api** | [Program.cs](../Program.cs), [OrdersController.cs](../Controllers/OrdersController.cs), [DemoController.cs](../Controllers/DemoController.cs), appsettings | Application, Infrastructure |
+
+**Một request đi qua các tầng thế nào:**
+
+```
+POST /orders ─► OrdersController (Api)
+                  └─► CreateOrderHandler.HandleAsync (Application)
+                        ├─ Order.Create(...)                         (Domain: kiểm tra bất biến)
+                        ├─ IOrderRepository.Add          ─► OrderRepository        (Infrastructure, EF)
+                        ├─ IOrderEventPublisher.Publish  ─► MassTransitOrderEventPublisher → IPublishEndpoint
+                        │                                    → thêm OutboxMessage vào CHÍNH AppDbContext
+                        └─ IUnitOfWork.SaveChangesAsync  ─► AppDbContext.SaveChanges: 1 transaction cho cả hai
+
+MassTransit ─► OrderCreatedConsumer (Infrastructure; middleware inbox bọc quanh)
+                  └─► ReserveStockHandler.HandleAsync (Application)
+                        └─ IStockRepository.TryReserveAsync ─► StockRepository: UPDATE ... WHERE Available >= @q
+```
+
+Các quyết định thiết kế khi tách tầng:
+
+1. **Outbox vẫn là MỘT transaction dù đi qua ba cổng.** `IOrderRepository`, `IOrderEventPublisher` và `IUnitOfWork` đều được cài trên **cùng một** `AppDbContext` của scope (`AppDbContext` chính là `IUnitOfWork`). Nếu chúng dùng DbContext khác nhau thì Order và message rơi vào hai transaction và pattern mất tác dụng (lỗi số 1 ở OUTBOX_PATTERN.md mục 4.6). Unit test [UseCaseTests.cs](../../outbox_pattern.MassTransitDemo.Tests/Unit/UseCaseTests.cs) khoá lại thứ tự `add → publish → commit (một lần)`.
+2. **Hợp đồng message `OrderCreated` nằm ở Infrastructure, không ở Application.** Đó là định dạng truyền tải (giống schema bảng), và nó mang `[MessageUrn]` của MassTransit. Application chỉ có cổng `PublishOrderCreatedAsync(Order)`. Khi tách thành nhiều service thật, record này thường chuyển sang một package "Contracts" dùng chung. Nhờ `[MessageUrn("orders.order-created.v1")]`, việc chuyển class sang namespace khác lúc tách tầng **không** đổi định danh message (vẫn là `urn:message:orders.order-created.v1`, ✅ test 1 ở mục 9).
+3. **Quy tắc "không trừ quá tồn" là một câu UPDATE có điều kiện trong `StockRepository`**, không phải method đọc-sửa-ghi trên entity `StockItem`. Nhiều consumer trừ cùng SKU đồng thời; đọc về rồi ghi lại sẽ mất cập nhật (case C3). Ghi chú ngay trong `StockItem.cs`.
+4. **Consumer là adapter mỏng.** `OrderCreatedConsumer` (Infrastructure) dịch message thành `ReserveStockCommand` rồi gọi use case; inbox/transaction do middleware MassTransit lo. Use case không biết mình được gọi từ broker.
+5. **Không dùng MediatR.** Handler là class thường, đăng ký DI trực tiếp, controller inject handler. Ít phụ thuộc hơn (MediatR hiện có bản thương mại tính phí theo đội; xem kỹ giấy phép nếu muốn dùng).
+6. **`TimeProvider` thay cho `DateTime.UtcNow`** trong use case, để unit test cố định được thời gian.
+7. **Ngoại lệ có chủ đích:** `DemoController` gọi thẳng công cụ ở Infrastructure (`DemoTools`, hai công tắc) để đọc bảng của MassTransit và cố ý tạo bản trùng — những việc code nghiệp vụ không được làm. Chỉ chạy ở Development.
 
 ---
 
@@ -122,10 +171,12 @@ Hai cách claim là hai lựa chọn hợp lệ đã bàn ở OUTBOX_PATTERN.md 
 
 ## 4. HOW — hoạt động từng bước và cách cài trong project
 
-### 4.1 Cấu hình (Program.cs)
+### 4.1 Cấu hình (Infrastructure/DependencyInjection.cs)
+
+`Program.cs` của Api chỉ gọi `AddApplication()` và `AddInfrastructure(configuration)`. Phần MassTransit nằm trong `AddInfrastructure`:
 
 ```csharp
-builder.Services.AddMassTransit(x =>
+services.AddMassTransit(x =>
 {
     x.AddEntityFrameworkOutbox<AppDbContext>(outbox =>
     {
@@ -151,7 +202,7 @@ builder.Services.AddMassTransit(x =>
 });
 ```
 
-Giá trị thật được đọc từ mục `"Outbox"` của [appsettings.json](../appsettings.json) qua [OutboxSettings.cs](../Messaging/OutboxSettings.cs). Các giá trị **mặc định của MassTransit 8.5.11** dưới đây được đọc trực tiếp từ thư viện (✅): `QueryDelay` 10 s, `QueryMessageLimit` 100, `QueryTimeout` 30 s, `DuplicateDetectionWindow` 30 phút, `MessageDeliveryLimit` 100, `MessageDeliveryTimeout` 10 s.
+Giá trị thật được đọc từ mục `"Outbox"` của [appsettings.json](../appsettings.json) qua [OutboxSettings.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Messaging/OutboxSettings.cs). Các giá trị **mặc định của MassTransit 8.5.11** dưới đây được đọc trực tiếp từ thư viện (✅): `QueryDelay` 10 s, `QueryMessageLimit` 100, `QueryTimeout` 30 s, `DuplicateDetectionWindow` 30 phút, `MessageDeliveryLimit` 100, `MessageDeliveryTimeout` 10 s.
 
 Và trong `DbContext`:
 
@@ -163,19 +214,27 @@ modelBuilder.AddOutboxStateEntity();
 
 ### 4.2 Bước 1 — Ghi (producer)
 
-[OrdersController.cs](../Controllers/OrdersController.cs):
+Use case [CreateOrderHandler](../../outbox_pattern.MassTransitDemo.Application/Orders/CreateOrder.cs) (Application) chỉ nói chuyện với các cổng:
 
 ```csharp
-db.Orders.Add(order);
-await publishEndpoint.Publish(new OrderCreated(...), ct); // KHÔNG gửi lên broker: thêm entity OutboxMessage vào db
-await db.SaveChangesAsync(ct);                            // một transaction duy nhất
+var order = Order.Create(command.Sku, command.Quantity, command.CustomerEmail, clock.GetUtcNow().UtcDateTime);
+
+orders.Add(order);                                       // IOrderRepository
+await events.PublishOrderCreatedAsync(order, ct);        // IOrderEventPublisher
+await unitOfWork.SaveChangesAsync(ct);                   // IUnitOfWork: một transaction duy nhất
+```
+
+Cổng `IOrderEventPublisher` được cài ở Infrastructure bằng bus outbox ([MassTransitOrderEventPublisher.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Messaging/MassTransitOrderEventPublisher.cs)):
+
+```csharp
+publishEndpoint.Publish(new OrderCreated(order.Id, order.Sku, ...), ct); // KHÔNG gửi lên broker: thêm OutboxMessage vào AppDbContext
 ```
 
 **Đã kiểm chứng** (log SQL thật khi `SaveChanges`): EF gửi **một batch** gồm `INSERT INTO [Orders]`, rồi `INSERT INTO [OutboxState]`, rồi `INSERT INTO [OutboxMessage]`, trong cùng transaction. Khi câu INSERT cuối bị lỗi, Order cũng bị rollback, không còn dòng nào ở cả ba bảng.
 
 Ba điều cần nhớ:
 - **Thứ tự `Publish` rồi `SaveChanges`.** Gọi `Publish` sau `SaveChanges` thì message nằm trong `DbContext` mà không được lưu.
-- **`IPublishEndpoint` phải lấy từ DI trong scope của request** (inject vào controller/service). `IBus.Publish` gửi thẳng lên broker, bỏ qua outbox, tức là quay lại dual-write.
+- **`IPublishEndpoint` phải lấy từ DI trong scope của request** (ở đây: inject vào `MassTransitOrderEventPublisher`, đăng ký scoped). `IBus.Publish` gửi thẳng lên broker, bỏ qua outbox, tức là quay lại dual-write.
 - `Publish` vẫn chạy qua **pipeline publish** của bus để dựng message, kể cả khi đích cuối là bảng outbox. (✅ quan sát khi làm demo: một filter chặn ở pipeline publish làm hỏng luôn `POST /orders`; vì vậy công tắc "transport sập" của demo chỉ chặn ở pipeline **send**.)
 
 ### 4.3 Bước 2 — Relay: `BusOutboxDeliveryService`
@@ -203,15 +262,15 @@ Các quyết định thiết kế (so với relay tự viết):
 
 ### 4.4 Bước 3 — Consumer + inbox
 
-[OrderCreatedConsumer.cs](../Inventory/OrderCreatedConsumer.cs) chỉ chứa nghiệp vụ:
+[OrderCreatedConsumer.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Messaging/OrderCreatedConsumer.cs) (Infrastructure) chỉ dịch message thành lệnh và gọi use case [ReserveStockHandler](../../outbox_pattern.MassTransitDemo.Application/Inventory/ReserveStock.cs); use case gọi cổng `IStockRepository`, được cài ở [Repositories.cs](../../outbox_pattern.MassTransitDemo.Infrastructure/Persistence/Repositories.cs) bằng một câu UPDATE có điều kiện:
 
 ```csharp
 await db.StockItems
-    .Where(s => s.Sku == message.Sku && s.Available >= message.Quantity)
-    .ExecuteUpdateAsync(s => s.SetProperty(x => x.Available, x => x.Available - message.Quantity));
+    .Where(s => s.Sku == sku && s.Available >= quantity)
+    .ExecuteUpdateAsync(s => s.SetProperty(x => x.Available, x => x.Available - quantity), ct) > 0;
 ```
 
-Middleware `UseEntityFrameworkOutbox` bao quanh nó. SQL thật (✅ log, rút gọn):
+Consumer, use case và repository dùng chung `AppDbContext` của scope message, nên câu UPDATE chạy trong transaction do middleware mở. Middleware `UseEntityFrameworkOutbox` bao quanh tất cả. SQL thật (✅ log, rút gọn):
 
 ```
 SELECT * FROM InboxState WITH (UPDLOCK, ROWLOCK) WHERE MessageId = @m AND ConsumerId = @c
@@ -384,7 +443,7 @@ Azure Service Bus (package `MassTransit.Azure.ServiceBus.Core`): `x.UsingAzureSe
 
 ## 9. Kết quả chạy thử trong project này
 
-Chạy bằng test tự động [outbox_pattern.MassTransitDemo.Tests](../../outbox_pattern.MassTransitDemo.Tests) (13 test, mỗi test một instance ứng dụng thật — Program.cs, bus, dịch vụ giao outbox, consumer — trên database LocalDB tạm, xoá khi xong). Bộ test chạy 12 lần liên tiếp đều xanh, ~8 giây mỗi lần.
+Chạy bằng test tự động [outbox_pattern.MassTransitDemo.Tests](../../outbox_pattern.MassTransitDemo.Tests): 13 test tích hợp (kịch bản 1–13 dưới đây, mỗi test một instance ứng dụng thật — Program.cs, bus, dịch vụ giao outbox, consumer — trên database LocalDB tạm, xoá khi xong) và 9 unit/architecture test không cần database (kịch bản 14–15). Trước khi tách Clean Architecture, 13 test tích hợp chạy 12 lần liên tiếp đều xanh; sau khi tách, toàn bộ 22 test chạy 5 lần liên tiếp đều xanh, ~7 giây mỗi lần.
 
 | # | Kịch bản | Kết quả đo được | Test |
 |---|---|---|---|
@@ -401,6 +460,8 @@ Chạy bằng test tự động [outbox_pattern.MassTransitDemo.Tests](../../out
 | 11 | 5 bản cùng `MessageId` | Kho trừ 1 lần; 1 dòng `InboxState`; `ReceiveCount` ≥ 5 | `TheSameMessageDeliveredSeveralTimes_...` |
 | 12 | Instance A mất transport, B khoẻ | B giao và xử lý cả 10 order đi qua A | `AnotherInstance_TakesOver...` |
 | 13 | Hai instance khoẻ, 60 order | Đúng 60 lần trừ kho, 60 dòng inbox | `TwoHealthyInstances_...` |
+| 14 | Use case với cổng giả (không DB) | `CreateOrderHandler` gọi đúng thứ tự add → publish → commit một lần; domain từ chối thì không publish, không commit; `ReserveStockHandler` dịch đúng kết quả | [UseCaseTests.cs](../../outbox_pattern.MassTransitDemo.Tests/Unit/UseCaseTests.cs) |
+| 15 | Quy tắc phụ thuộc | Domain không dùng project/framework nào; Application không dùng Infrastructure, Api, EF Core, MassTransit; Infrastructure không dùng Api | [ArchitectureTests.cs](../../outbox_pattern.MassTransitDemo.Tests/Unit/ArchitectureTests.cs) |
 
 Các giá trị mặc định ở mục 4.1 được đọc trực tiếp từ MassTransit 8.5.11 bằng reflection lúc viết tài liệu.
 
@@ -411,12 +472,14 @@ Các giá trị mặc định ở mục 4.1 được đọc trực tiếp từ M
 Yêu cầu: .NET 10 SDK và SQL Server LocalDB. Database `OutboxPatternMassTransitDemo` (khác database của project `outbox_pattern`) được **tự tạo** ở lần chạy đầu (`EnsureCreated`), gồm cả ba bảng của MassTransit.
 
 ```powershell
-cd "E:\Sơn\outbox pattern\outbox pattern git\outbox-pattern-\outbox_pattern.MassTransitDemo"
-dotnet run --launch-profile http        # http://localhost:5200
+cd "E:\Sơn\outbox pattern\outbox pattern git\outbox-pattern-"
+dotnet run --project outbox_pattern.MassTransitDemo.Api --launch-profile http        # http://localhost:5200
 ```
 
+Trong Visual Studio: chọn `outbox_pattern.MassTransitDemo.Api` làm startup project (nằm trong thư mục solution `MassTransitDemo`).
+
 - **Swagger UI:** `http://localhost:5200/swagger`. Project này không chuyển hướng sang HTTPS ở môi trường Development nên dùng được cả http lẫn https (profile `https` có thêm `https://localhost:7228`).
-- **Kịch bản có sẵn:** mở [outbox_pattern.MassTransitDemo.http](../outbox_pattern.MassTransitDemo.http) và chạy lần lượt 0 → 6.
+- **Kịch bản có sẵn:** mở [outbox_pattern.MassTransitDemo.Api.http](../outbox_pattern.MassTransitDemo.Api.http) và chạy lần lượt 0 → 6.
 - **Quan sát:** `GET /demo/state` trả về số order, số dòng outbox đang chờ, inbox, tồn kho và trạng thái hai công tắc. Log của app có `Outbox Send Fault`, `Outbox Send Timeout`, `R-RETRY`, `R-FAULT`, `Order …: reserved …`.
 - **Nhìn bằng SSMS:** server `(localdb)\MSSQLLocalDB`, tích "Trust Server Certificate", database `OutboxPatternMassTransitDemo`, các bảng `OutboxMessage`, `OutboxState`, `InboxState`. Dòng outbox biến mất ngay khi được giao, nên muốn thấy nó thì `PUT /demo/transport/down` trước khi tạo order.
 

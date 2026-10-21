@@ -21,7 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\outbox_pattern.MassTransitDemo\outbox_pattern.MassTransitDemo.csproj" />
+    <ProjectReference Include="..\outbox_pattern.MassTransitDemo.Api\outbox_pattern.MassTransitDemo.Api.csproj" />
   </ItemGroup>
 
 </Project>

@@ -1,6 +1,6 @@
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
-using outbox_pattern.MassTransitDemo.Persistence;
+using outbox_pattern.MassTransitDemo.Infrastructure.Persistence;
 
 namespace outbox_pattern.MassTransitDemo.Tests.Infrastructure;
 

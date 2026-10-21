@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Use case + các "cổng" (interface) mà tầng ngoài phải cài. Chỉ phụ thuộc Domain; không biết EF Core hay MassTransit. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\outbox_pattern.MassTransitDemo.Domain\outbox_pattern.MassTransitDemo.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

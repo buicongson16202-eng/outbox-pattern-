@@ -1,6 +1,11 @@
 <Solution>
   <Project Path="outbox_pattern/outbox_pattern.csproj" />
-  <Project Path="outbox_pattern.MassTransitDemo/outbox_pattern.MassTransitDemo.csproj" />
-  <Project Path="outbox_pattern.MassTransitDemo.Tests/outbox_pattern.MassTransitDemo.Tests.csproj" />
   <Project Path="outbox_pattern.Tests/outbox_pattern.Tests.csproj" />
+  <Folder Name="/MassTransitDemo/">
+    <Project Path="outbox_pattern.MassTransitDemo.Api/outbox_pattern.MassTransitDemo.Api.csproj" />
+    <Project Path="outbox_pattern.MassTransitDemo.Application/outbox_pattern.MassTransitDemo.Application.csproj" />
+    <Project Path="outbox_pattern.MassTransitDemo.Domain/outbox_pattern.MassTransitDemo.Domain.csproj" />
+    <Project Path="outbox_pattern.MassTransitDemo.Infrastructure/outbox_pattern.MassTransitDemo.Infrastructure.csproj" />
+    <Project Path="outbox_pattern.MassTransitDemo.Tests/outbox_pattern.MassTransitDemo.Tests.csproj" />
+  </Folder>
 </Solution>

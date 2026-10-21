@@ -1,4 +1,4 @@
-namespace outbox_pattern.MassTransitDemo.Messaging
+namespace outbox_pattern.MassTransitDemo.Infrastructure.Demo
 {
     /// <summary>
     /// Công tắc phục vụ demo: giả lập "broker sập" hoặc "broker treo" cho transport in-memory (vốn không bao giờ lỗi).

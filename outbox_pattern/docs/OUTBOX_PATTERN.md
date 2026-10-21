@@ -505,7 +505,7 @@ Giữ polling làm lưới an toàn, nhưng bổ sung tín hiệu để giảm �
 
 Project này tự cài để bạn thấy từng cơ chế. Ở production nên cân nhắc thư viện đã được kiểm chứng có sẵn outbox/inbox, như MassTransit (EF Core outbox), NServiceBus (Outbox), Wolverine (durable inbox/outbox) hoặc CAP (DotNetCore.CAP). **Hãy kiểm tra license và phiên bản hiện hành** của từng thư viện trước khi chọn.
 
-Cùng bài toán này cài bằng MassTransit nằm ở project [outbox_pattern.MassTransitDemo](../../outbox_pattern.MassTransitDemo); tài liệu so sánh từng bước với bản tự viết: [masstransit.md](../../outbox_pattern.MassTransitDemo/docs/masstransit.md).
+Cùng bài toán này cài bằng MassTransit (tổ chức theo Clean Architecture: Api, Application, Domain, Infrastructure) nằm ở các project `outbox_pattern.MassTransitDemo.*`, chạy từ [outbox_pattern.MassTransitDemo.Api](../../outbox_pattern.MassTransitDemo.Api); tài liệu so sánh từng bước với bản tự viết: [masstransit.md](../../outbox_pattern.MassTransitDemo.Api/docs/masstransit.md).
 
 ### 8.5 Cách claim: lease (project này) hay khoá trong transaction
 

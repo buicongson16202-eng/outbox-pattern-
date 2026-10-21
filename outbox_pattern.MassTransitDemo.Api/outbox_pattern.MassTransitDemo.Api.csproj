@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- Tầng trình bày + composition root: controller HTTP mỏng, gọi use case của Application; nối mọi tầng lại ở Program.cs. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" Version="10.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\outbox_pattern.MassTransitDemo.Application\outbox_pattern.MassTransitDemo.Application.csproj" />
+    <!-- Chỉ để đăng ký DI (AddInfrastructure) và các endpoint /demo; controller nghiệp vụ không dùng kiểu nào của Infrastructure. -->
+    <ProjectReference Include="..\outbox_pattern.MassTransitDemo.Infrastructure\outbox_pattern.MassTransitDemo.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace outbox_pattern.MassTransitDemo.Inventory
+namespace outbox_pattern.MassTransitDemo.Infrastructure.Demo
 {
     /// <summary>
     /// Công tắc phục vụ demo: bắt consumer ném lỗi N lần tiếp theo để quan sát retry và hàng _error.

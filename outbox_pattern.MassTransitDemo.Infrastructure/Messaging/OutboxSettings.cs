@@ -1,4 +1,4 @@
-namespace outbox_pattern.MassTransitDemo.Messaging
+namespace outbox_pattern.MassTransitDemo.Infrastructure.Messaging
 {
     /// <summary>Cấu hình lấy từ appsettings.json, mục "Outbox".</summary>
     public class OutboxSettings

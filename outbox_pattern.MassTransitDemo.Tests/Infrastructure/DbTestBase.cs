@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
-using outbox_pattern.MassTransitDemo.Controllers;
+using outbox_pattern.MassTransitDemo.Application.Orders;
 
 namespace outbox_pattern.MassTransitDemo.Tests.Infrastructure;
 
@@ -37,7 +37,7 @@ public abstract class DbTestBase(LocalDbFixture db) : IAsyncLifetime
         var response = await PostOrderRawAsync(new { sku, quantity, customerEmail = "buyer@example.com" }, api);
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
 
-        var order = await response.Content.ReadFromJsonAsync<OrderResponse>();
+        var order = await response.Content.ReadFromJsonAsync<OrderDto>();
         Assert.NotNull(order);
 
         return order.Id;
